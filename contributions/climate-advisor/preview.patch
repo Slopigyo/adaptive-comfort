@@ -1,0 +1,2154 @@
+diff --git a/custom_components/climate_advisor/adaptive_mode_preview.py b/custom_components/climate_advisor/adaptive_mode_preview.py
+new file mode 100644
+--- /dev/null
++++ b/custom_components/climate_advisor/adaptive_mode_preview.py
+@@ -0,0 +1,435 @@
++# SPDX-License-Identifier: MIT
++"""Disconnected, single-zone mode decisions; never a thermostat dispatcher.
++
++Snapshots/revisions are caller-supplied evidence, not an HA ownership detector.
++Requests select an evaluator, not a target. No existing engine imports this model.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field, replace
++from typing import Literal, TypeGuard
++
++ADAPTIVE_POLICY = "adaptive_comfort"
++Hold = Literal["none", "manual", "reconcile"]
++Handback = Literal["none", "pending", "unknown"]
++RequestKind = Literal["ordinary", "adaptive", "handback"]
++_EVENTS = (
++    "refresh",
++    "enable",
++    "disable",
++    "manual_change",
++    "resume",
++    "restart",
++    "handback_confirmed",
++    "handback_failed",
++    "retry_handback",
++)
++
++
++@dataclass(frozen=True)
++class HostPolicy:
++    """Current ordinary policy reference and retained host permissions."""
++
++    policy_id: str
++    owner_revision: int
++    settings_revision: int
++    automation_enabled: bool = False
++    observe_only: bool = True
++    external_hold: bool = False
++
++
++@dataclass(frozen=True)
++class ModeInputs:
++    """Explicit fake-host evidence; ready does not implement safety checks."""
++
++    host: HostPolicy
++    routine_revision: int = 0
++    approved: bool = False
++    ready: bool = False
++
++
++@dataclass(frozen=True)
++class ModeRequest:
++    """Request fresh policy evaluation, never restoration of a stored target."""
++
++    kind: RequestKind
++    policy_id: str
++    session_id: str
++    generation: int
++    inputs: ModeInputs
++    commands_allowed: Literal[False] = field(default=False, init=False)
++
++
++@dataclass(frozen=True)
++class ModeState:
++    """Caller retains each returned state; use a fresh session ID after reconstruction."""
++
++    session_id: str
++    generation: int = 0
++    selected: bool = False
++    previous: HostPolicy | None = None
++    routine_revision: int | None = None
++    hold: Hold = "none"
++    handback: Handback = "none"
++    pending_request: ModeRequest | None = None
++
++
++@dataclass(frozen=True)
++class ModeEvent:
++    """An explicit event from this session/generation, not an automatic callback."""
++
++    kind: str
++    session_id: str
++    generation: int
++    reconciled: bool = False
++    request: ModeRequest | None = None
++
++
++@dataclass(frozen=True)
++class ModeDecision:
++    """A next state and explained selection/withholding, with no command permission."""
++
++    state: ModeState
++    reason_code: str
++    explanation: str
++    request: ModeRequest | None = None
++    commands_allowed: Literal[False] = field(default=False, init=False)
++
++
++def _identity(value: object) -> bool:
++    return isinstance(value, str) and bool(value.strip())
++
++
++def _revision(value: object) -> bool:
++    return type(value) is int and value >= 0
++
++
++def _valid_host(host: object) -> TypeGuard[HostPolicy]:
++    return (
++        isinstance(host, HostPolicy)
++        and _identity(host.policy_id)
++        and host.policy_id != ADAPTIVE_POLICY
++        and _revision(host.owner_revision)
++        and _revision(host.settings_revision)
++        and all(type(flag) is bool for flag in (host.automation_enabled, host.observe_only, host.external_hold))
++    )
++
++
++def _valid_inputs(inputs: object) -> TypeGuard[ModeInputs]:
++    return (
++        isinstance(inputs, ModeInputs)
++        and _valid_host(inputs.host)
++        and _revision(inputs.routine_revision)
++        and type(inputs.approved) is bool
++        and type(inputs.ready) is bool
++    )
++
++
++def _valid_request(request: object) -> TypeGuard[ModeRequest]:
++    return (
++        isinstance(request, ModeRequest)
++        and request.kind in ("ordinary", "adaptive", "handback")
++        and _identity(request.policy_id)
++        and _identity(request.session_id)
++        and _revision(request.generation)
++        and _valid_inputs(request.inputs)
++        and request.commands_allowed is False
++    )
++
++
++def _same_owner(previous: HostPolicy | None, host: HostPolicy) -> bool:
++    return previous is not None and (previous.policy_id, previous.owner_revision) == (
++        host.policy_id,
++        host.owner_revision,
++    )
++
++
++def _valid_state(state: object) -> TypeGuard[ModeState]:
++    if not (
++        isinstance(state, ModeState)
++        and _identity(state.session_id)
++        and _revision(state.generation)
++        and type(state.selected) is bool
++        and state.hold in ("none", "manual", "reconcile")
++        and state.handback in ("none", "pending", "unknown")
++    ):
++        return False
++    if state.handback != "none" and state.hold == "manual":
++        return False
++    if state.selected:
++        if state.handback != "none" or not _revision(state.routine_revision):
++            return False
++    elif state.routine_revision is not None:
++        return False
++    if state.selected or state.handback != "none":
++        if not _valid_host(state.previous):
++            return False
++    elif state.previous is not None:
++        return False
++    if state.handback == "pending":
++        request = state.pending_request
++        return (
++            state.hold == "none"
++            and _valid_request(request)
++            and request.kind == "handback"
++            and (request.session_id, request.generation) == (state.session_id, state.generation)
++            and request.policy_id == request.inputs.host.policy_id
++            and _same_owner(state.previous, request.inputs.host)
++        )
++    return state.pending_request is None
++
++
++def _valid_event(event: object) -> TypeGuard[ModeEvent]:
++    return (
++        isinstance(event, ModeEvent)
++        and isinstance(event.kind, str)
++        and event.kind in _EVENTS
++        and _identity(event.session_id)
++        and _revision(event.generation)
++        and type(event.reconciled) is bool
++        and (event.request is None or _valid_request(event.request))
++    )
++
++
++def _held(state: ModeState, hold: Hold, *, force: bool = False) -> ModeState:
++    hold = "manual" if state.hold == "manual" else hold
++    handback: Handback = "unknown" if state.handback != "none" and hold != "manual" else "none"
++    updated = replace(
++        state,
++        hold=hold,
++        handback=handback,
++        previous=state.previous if state.selected or handback != "none" else None,
++        pending_request=None,
++    )
++    return replace(updated, generation=state.generation + 1) if force or updated != state else state
++
++
++def _ordinary_only(state: ModeState) -> bool:
++    return not state.selected and state.hold == "none" and state.handback == "none"
++
++
++def _disable_held(state: ModeState) -> ModeState:
++    if not state.selected:
++        return state
++    handback: Handback = "none" if state.hold == "manual" else "unknown"
++    return replace(
++        state,
++        generation=state.generation + 1,
++        selected=False,
++        routine_revision=None,
++        previous=state.previous if handback == "unknown" else None,
++        handback=handback,
++        pending_request=None,
++    )
++
++
++def _guard(state: ModeState, inputs: ModeInputs) -> ModeState:
++    # An unused overlay must not replace the ordinary host's hold policy.
++    if _ordinary_only(state):
++        return state
++    if inputs.host.external_hold or (state.previous is not None and not _same_owner(state.previous, inputs.host)):
++        return _held(state, "manual")
++    if state.selected and (
++        not inputs.approved or not inputs.ready or state.routine_revision != inputs.routine_revision
++    ):
++        return _held(state, "reconcile")
++    if state.handback == "pending" and (
++        not inputs.ready or state.pending_request is None or state.pending_request.inputs != inputs
++    ):
++        return _held(state, "reconcile")
++    return state
++
++
++def request_is_current(request: object, state: object, inputs: object) -> bool:
++    """Reject stale selector work; not an authorization or atomic dispatch check."""
++    if not (_valid_request(request) and _valid_state(state) and _valid_inputs(inputs)):
++        return False
++    if (request.session_id, request.generation, request.inputs) != (state.session_id, state.generation, inputs):
++        return False
++    if state.hold != "none" or (inputs.host.external_hold and not _ordinary_only(state)):
++        return False
++    if state.selected:
++        return (
++            request.kind == "adaptive"
++            and request.policy_id == ADAPTIVE_POLICY
++            and inputs.approved
++            and inputs.ready
++            and inputs.routine_revision == state.routine_revision
++            and _same_owner(state.previous, inputs.host)
++        )
++    if state.handback == "pending":
++        return (
++            request == state.pending_request
++            and inputs.ready
++            and request.kind == "handback"
++            and request.policy_id == inputs.host.policy_id
++            and _same_owner(state.previous, inputs.host)
++        )
++    return state.handback == "none" and request.kind == "ordinary" and request.policy_id == inputs.host.policy_id
++
++
++def _selection(state: ModeState, inputs: ModeInputs, reason: str) -> ModeDecision:
++    if state.hold == "manual":
++        return ModeDecision(
++            state, "manual_hold", "A manual/external hold needs explicit reconciled resume; no evaluation."
++        )
++    if state.handback != "none":
++        return ModeDecision(state, f"handback_{state.handback}", "Logical hand-back is unresolved; no automatic retry.")
++    if state.hold == "reconcile":
++        return ModeDecision(
++            state, "reconciliation_required", "Current evidence must be reconciled and explicitly resumed."
++        )
++    kind: RequestKind = "adaptive" if state.selected else "ordinary"
++    policy_id = ADAPTIVE_POLICY if state.selected else inputs.host.policy_id
++    request = ModeRequest(kind, policy_id, state.session_id, state.generation, inputs)
++    return ModeDecision(
++        state, reason, "Evaluate the selected policy afresh; no target or command is restored.", request
++    )
++
++
++def _begin_handback(state: ModeState, inputs: ModeInputs) -> ModeDecision:
++    state = replace(
++        state,
++        generation=state.generation + 1,
++        selected=False,
++        routine_revision=None,
++        hold="none",
++        handback="pending",
++        pending_request=None,
++    )
++    request = ModeRequest("handback", inputs.host.policy_id, state.session_id, state.generation, inputs)
++    state = replace(state, pending_request=request)
++    return ModeDecision(
++        state,
++        "handback_requested",
++        "Adaptive selection ended; current ordinary-policy evaluation is pending, not restored.",
++        request,
++    )
++
++
++def decide_mode(state: ModeState, inputs: ModeInputs, event: ModeEvent) -> ModeDecision:
++    """Apply one synthetic event without changing host settings or executing policy.
++
++    Invalid internal state is a caller error, never an implicit reset. Live inputs
++    fail closed into reconciliation. Sessions/revisions must be maintained by the
++    caller; this module cannot observe equipment, correlate HA writes or persist.
++    """
++    if not _valid_state(state):
++        raise ValueError("Invalid mode state; reconstruct explicitly with a fresh session ID, never a guessed reset.")
++    if not _valid_event(event):
++        return ModeDecision(state, "invalid_event", "Supply a valid explicit mode event; no event was executed.")
++    if (event.session_id, event.generation) != (state.session_id, state.generation):
++        return ModeDecision(state, "stale_event", "The event belongs to an obsolete session or generation.")
++    if not _valid_inputs(inputs):
++        if _ordinary_only(state):
++            state = replace(state, generation=state.generation + 1)
++        else:
++            state = _held(state, "manual" if event.kind == "manual_change" else "reconcile", force=True)
++            if event.kind == "disable":
++                state = _disable_held(state)
++        return ModeDecision(
++            state, "invalid_inputs", "Invalid current evidence; work invalidated with no fallback request."
++        )
++
++    state = _guard(state, inputs)
++    if _ordinary_only(state) and event.kind in ("manual_change", "restart", "resume"):
++        state = replace(state, generation=state.generation + 1)
++        return ModeDecision(
++            state, "ordinary_unchanged", "Adaptive mode owns no policy or hold; ordinary behavior is retained."
++        )
++    if event.kind == "manual_change":
++        return ModeDecision(
++            _held(state, "manual", force=True), "manual_hold", "Newer manual authority takes precedence."
++        )
++    if event.kind == "restart":
++        return ModeDecision(
++            _held(state, "reconcile", force=True),
++            "restart_requires_reconciliation",
++            "Outstanding work invalidated; restart cannot automatically resume a policy or complete hand-back.",
++        )
++    if event.kind == "refresh":
++        return _selection(state, inputs, "adaptive_selected" if state.selected else "ordinary_selected")
++
++    if event.kind in ("handback_confirmed", "handback_failed"):
++        if state.handback != "pending" or not request_is_current(event.request, state, inputs):
++            return ModeDecision(
++                state, "stale_handback", "Only the matching current pending request can report an outcome."
++            )
++        if event.kind == "handback_failed":
++            state = replace(state, generation=state.generation + 1, handback="unknown", pending_request=None)
++            return ModeDecision(state, "handback_failed", "Logical hand-back outcome is unknown; no automatic retry.")
++        state = replace(state, generation=state.generation + 1, handback="none", previous=None, pending_request=None)
++        return ModeDecision(
++            state, "handback_confirmed", "Logical hand-back confirmed by the caller; not proof of physical release."
++        )
++
++    if event.kind == "retry_handback":
++        if state.handback != "unknown":
++            return ModeDecision(state, "no_handback_to_retry", "There is no unknown, still-owned hand-back to retry.")
++        if not event.reconciled:
++            return ModeDecision(
++                state, "retry_requires_reconciliation", "Retry requires explicit current-state reconciliation."
++            )
++        if not inputs.ready:
++            return ModeDecision(
++                _held(state, "reconcile"), "not_ready", "Required current inputs are not ready for hand-back."
++            )
++        return _begin_handback(state, inputs)
++
++    if event.kind == "disable":
++        if not state.selected:
++            return ModeDecision(
++                state, "already_disabled", "Adaptive selection is already off; no duplicate return request."
++            )
++        if state.hold != "none":
++            state = _disable_held(state)
++            return ModeDecision(
++                state,
++                "disabled_preserving_hold",
++                "Adaptive selection ended without overwriting newer or unknown authority.",
++            )
++        return _begin_handback(state, inputs)
++
++    if state.handback != "none":
++        return _selection(state, inputs, "blocked")
++    if event.kind == "resume":
++        if not event.reconciled:
++            return ModeDecision(
++                state, "resume_requires_reconciliation", "Resume requires explicit current-state reconciliation."
++            )
++        if inputs.host.external_hold:
++            return _selection(state, inputs, "blocked")
++        if not inputs.ready or (state.selected and not inputs.approved):
++            return ModeDecision(
++                state, "not_ready", "Resume needs valid current inputs and approval for adaptive selection."
++            )
++        state = replace(
++            state,
++            generation=state.generation + 1,
++            hold="none",
++            previous=inputs.host if state.selected else None,
++            routine_revision=inputs.routine_revision if state.selected else None,
++        )
++        return _selection(state, inputs, "resumed")
++
++    if state.hold != "none":
++        return _selection(state, inputs, "blocked")
++    if inputs.host.external_hold:
++        return ModeDecision(
++            state, "manual_hold", "An existing host hold blocks adaptive enable; ordinary behavior is retained."
++        )
++    if not inputs.approved:
++        return ModeDecision(state, "unapproved", "Enabling the feature cannot approve a routine.")
++    if not inputs.ready:
++        return ModeDecision(state, "not_ready", "Required inputs are not ready; adaptive selection was not enabled.")
++    if state.selected:
++        return _selection(state, inputs, "already_selected")
++    state = replace(
++        state,
++        generation=state.generation + 1,
++        selected=True,
++        previous=inputs.host,
++        routine_revision=inputs.routine_revision,
++    )
++    return _selection(state, inputs, "adaptive_selected")
+diff --git a/custom_components/climate_advisor/sleep_timing.py b/custom_components/climate_advisor/sleep_timing.py
+new file mode 100644
+--- /dev/null
++++ b/custom_components/climate_advisor/sleep_timing.py
+@@ -0,0 +1,157 @@
++# SPDX-License-Identifier: MIT
++"""Resolve one local wake date for a disconnected preview, never run a schedule.
++
++ZoneInfo reads locally installed IANA data; there is no network/database download,
++HA access, host-clock read, temperature policy, persistence, or command path.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from datetime import UTC, date, datetime, time, timedelta
++from itertools import pairwise
++from typing import Literal
++from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
++
++
++@dataclass(frozen=True)
++class LocalSleepTiming:
++    """Explicit wall times and elapsed ramps for a caller-supplied wake date.
++
++    Wind-down and sleep may begin on that date (offset 0) or the preceding date
++    (offset -1). Wake time belongs to the supplied date. There are no defaults.
++    """
++
++    timezone_key: str
++    wind_down_start: time
++    wind_down_day_offset: int
++    sleep_start: time
++    sleep_day_offset: int
++    wake_time: time
++    warming_duration: timedelta
++    return_duration: timedelta
++
++
++@dataclass(frozen=True)
++class TimingAnchor:
++    """An ordered UTC phase boundary, without a temperature or approval flag."""
++
++    at: datetime
++    phase: str
++
++
++@dataclass(frozen=True)
++class SleepTimingResolution:
++    """Dated timing or an explanation; never a partially resolved routine."""
++
++    status: Literal["resolved", "withheld"]
++    reason_code: str
++    explanation: str
++    anchors: tuple[TimingAnchor, ...] = ()
++    adjustments: tuple[str, ...] = ()
++    commands_allowed: Literal[False] = field(default=False, init=False)
++
++
++class _InvalidTiming(ValueError):
++    def __init__(self, reason_code: str, message: str) -> None:
++        super().__init__(message)
++        self.reason_code = reason_code
++
++
++def _resolve_wall(wall: datetime, zone: ZoneInfo, label: str) -> tuple[datetime, str | None]:
++    # Attaching tzinfo alone accepts nonexistent times. Round-trip both folds
++    # through UTC to distinguish ordinary, repeated and missing wall times.
++    candidates = {wall.replace(tzinfo=zone, fold=fold).astimezone(UTC) for fold in (0, 1)}
++    round_trips = [(instant, instant.astimezone(zone).replace(tzinfo=None)) for instant in candidates]
++    valid = sorted(instant for instant, local in round_trips if local == wall)
++    if valid:
++        adjustment = None
++        if len(valid) > 1:
++            adjustment = f"{label}: DST fold at {wall.isoformat()}; chose earlier occurrence {valid[0].isoformat()}."
++        return valid[0], adjustment
++
++    forward = sorted((local, instant) for instant, local in round_trips if local > wall)
++    if not forward:
++        raise _InvalidTiming("invalid_time", f"{label}: local time cannot be resolved by the gap-forward policy.")
++    shifted, instant = forward[0]
++    if shifted.date() != wall.date():
++        raise _InvalidTiming("date_shift", f"{label}: gap resolution would change the requested calendar date.")
++    return instant, f"{label}: DST gap moved {wall.isoformat()} forward to {shifted.isoformat()} in {zone.key}."
++
++
++def resolve_sleep_timing(config: LocalSleepTiming, *, wake_date: date) -> SleepTimingResolution:
++    """Resolve fixed-wake timing using local IANA rules and exact elapsed ramps.
++
++    Gaps move forward by the actual offset gap; folds use the earlier UTC instant.
++    Calendar-date changes caused by a gap are withheld rather than moving a night
++    to another wake date. All five UTC instants must be strictly increasing.
++
++    This does not enable/approve a routine or validate its bands/rates. Callers
++    must still pass dated anchors through the trajectory evaluator. Repeating
++    dates, adjacent-routine overlap, lifecycle invalidation and control are not
++    implemented here.
++    """
++    try:
++        if not isinstance(config, LocalSleepTiming):
++            raise _InvalidTiming("invalid_configuration", "Supply an explicit LocalSleepTiming configuration.")
++        if type(wake_date) is not date:
++            raise _InvalidTiming("invalid_date", "Supply a wake date, not a datetime, string or host-clock default.")
++        for offset in (config.wind_down_day_offset, config.sleep_day_offset):
++            if type(offset) is not int or offset not in (-1, 0):
++                raise _InvalidTiming("invalid_offset", "Wind-down/sleep day offsets must be integers -1 or 0.")
++        for wall_time in (config.wind_down_start, config.sleep_start, config.wake_time):
++            if not isinstance(wall_time, time) or wall_time.tzinfo is not None or wall_time.fold != 0:
++                raise _InvalidTiming(
++                    "invalid_time", "Supply naive wall times with fold=0; the resolver owns DST policy."
++                )
++        for duration in (config.warming_duration, config.return_duration):
++            if not isinstance(duration, timedelta) or duration <= timedelta(0):
++                raise _InvalidTiming("invalid_duration", "Warming and return durations must be positive timedeltas.")
++        if not isinstance(config.timezone_key, str) or not config.timezone_key:
++            raise _InvalidTiming("invalid_timezone", "Supply an explicit IANA timezone key.")
++        try:
++            zone = ZoneInfo(config.timezone_key)
++        except (ZoneInfoNotFoundError, ValueError, OSError) as error:
++            raise _InvalidTiming(
++                "invalid_timezone",
++                "IANA timezone or local timezone data is unavailable; no zone was guessed or downloaded.",
++            ) from error
++
++        wall_specs = (
++            ("wind_down", config.wind_down_day_offset, config.wind_down_start),
++            ("sleeping", config.sleep_day_offset, config.sleep_start),
++            ("wake", 0, config.wake_time),
++        )
++        resolved: list[datetime] = []
++        adjustments: list[str] = []
++        for label, offset, wall_time in wall_specs:
++            wall = datetime.combine(wake_date + timedelta(days=offset), wall_time)
++            instant, adjustment = _resolve_wall(wall, zone, label)
++            resolved.append(instant)
++            if adjustment:
++                adjustments.append(adjustment)
++        wind_down, sleeping, wake = resolved
++        anchors = (
++            TimingAnchor(wind_down, "wind_down"),
++            TimingAnchor(sleeping, "sleeping"),
++            TimingAnchor(wake - config.warming_duration, "waking"),
++            TimingAnchor(wake, "return_to_day"),
++            TimingAnchor(wake + config.return_duration, "daytime"),
++        )
++        if any(left.at >= right.at for left, right in pairwise(anchors)):
++            raise _InvalidTiming(
++                "invalid_order", "Resolved phases overlap or have zero duration; no times were reordered."
++            )
++        return SleepTimingResolution(
++            "resolved",
++            "ready",
++            "Resolved one fixed-wake routine in UTC; bands, approval and elapsed rates still require validation.",
++            anchors,
++            tuple(adjustments),
++        )
++    except _InvalidTiming as error:
++        return SleepTimingResolution("withheld", error.reason_code, str(error))
++    except (OverflowError, ValueError) as error:
++        return SleepTimingResolution(
++            "withheld", "invalid_time", f"Resolved times or durations exceed datetime's range: {error}."
++        )
+diff --git a/custom_components/climate_advisor/sleep_trajectory.py b/custom_components/climate_advisor/sleep_trajectory.py
+new file mode 100644
+--- /dev/null
++++ b/custom_components/climate_advisor/sleep_trajectory.py
+@@ -0,0 +1,223 @@
++# SPDX-License-Identifier: MIT
++"""Disconnected sleep/wake band preview; no planner, HA, clock, or actuator access.
++
++Inputs describe one already-resolved night, not a recurring local-time schedule.
++All temperatures and rates use internal Fahrenheit. Returned floats are preview
++values, not quantized device targets or permission to choose an HVAC mode.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from datetime import UTC, datetime, timedelta
++from fractions import Fraction
++from itertools import pairwise
++from math import isfinite
++from typing import Literal
++
++_PHASES = ("wind_down", "sleeping", "waking", "return_to_day", "daytime")
++_MICROSECOND = timedelta(microseconds=1)
++_HOUR_MICROSECONDS = 3_600_000_000
++
++
++@dataclass(frozen=True)
++class TrajectoryAnchor:
++    """The band and phase beginning at an explicitly supplied aware instant."""
++
++    at: datetime
++    floor_f: float
++    ceiling_f: float
++    phase: str
++
++
++@dataclass(frozen=True)
++class TrajectoryLimits:
++    """Caller-approved arithmetic constraints, with no household defaults."""
++
++    minimum_f: float
++    maximum_f: float
++    minimum_width_f: float
++    maximum_rate_f_per_hour: float
++
++
++@dataclass(frozen=True)
++class SleepTrajectory:
++    """Five ordered anchors; merely enabling a routine does not approve it."""
++
++    anchors: tuple[TrajectoryAnchor, ...] = ()
++    limits: TrajectoryLimits | None = None
++    enabled: bool = False
++    approved: bool = False
++
++
++@dataclass(frozen=True)
++class TrajectoryPreview:
++    """A preview or an explained absence of one, never a control decision."""
++
++    status: Literal["disabled", "withheld", "preview"]
++    reason_code: str
++    explanation: str
++    floor_f: float | None = None
++    ceiling_f: float | None = None
++    phase: str | None = None
++    commands_allowed: Literal[False] = field(default=False, init=False)
++
++
++@dataclass(frozen=True)
++class _Point:
++    at: datetime
++    floor: Fraction
++    ceiling: Fraction
++    phase: str
++
++
++class _InvalidTrajectory(ValueError):
++    def __init__(self, reason_code: str, message: str) -> None:
++        super().__init__(message)
++        self.reason_code = reason_code
++
++
++def _number(value: object, name: str, reason_code: str) -> Fraction:
++    try:
++        if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
++            raise ValueError
++        # Decimal representations preserve exact declared width/rate boundaries;
++        # rational interpolation also avoids overflow between extreme finite edges.
++        return Fraction(str(value))
++    except (TypeError, ValueError, OverflowError) as error:
++        raise _InvalidTrajectory(reason_code, f"{name} must be a finite number, not a boolean or string.") from error
++
++
++def _utc(value: object, name: str) -> datetime:
++    try:
++        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
++            raise ValueError
++        return value.astimezone(UTC)
++    except (TypeError, ValueError, OverflowError) as error:
++        raise _InvalidTrajectory("invalid_time", f"{name} must be an aware datetime representable in UTC.") from error
++
++
++def _check_band(
++    floor: Fraction,
++    ceiling: Fraction,
++    minimum: Fraction,
++    maximum: Fraction,
++    width: Fraction,
++    *,
++    reason_code: str = "invalid_band",
++) -> None:
++    if not minimum <= floor < ceiling <= maximum or ceiling - floor < width:
++        raise _InvalidTrajectory(reason_code, "Both band edges must fit the approved bounds and minimum width.")
++
++
++def _validate(config: SleepTrajectory) -> tuple[tuple[_Point, ...], Fraction, Fraction, Fraction]:
++    limits = config.limits
++    if not isinstance(limits, TrajectoryLimits):
++        raise _InvalidTrajectory("invalid_configuration", "An enabled, approved routine needs explicit limits.")
++    minimum = _number(limits.minimum_f, "minimum_f", "invalid_limits")
++    maximum = _number(limits.maximum_f, "maximum_f", "invalid_limits")
++    width = _number(limits.minimum_width_f, "minimum_width_f", "invalid_limits")
++    rate = _number(limits.maximum_rate_f_per_hour, "maximum_rate_f_per_hour", "invalid_limits")
++    if minimum >= maximum or not 0 < width <= maximum - minimum or rate <= 0:
++        raise _InvalidTrajectory(
++            "invalid_limits", "Bounds, positive band width and positive edge rate must be feasible."
++        )
++
++    anchors = config.anchors
++    if (
++        not isinstance(anchors, tuple)
++        or len(anchors) != len(_PHASES)
++        or not all(isinstance(anchor, TrajectoryAnchor) for anchor in anchors)
++        or tuple(anchor.phase for anchor in anchors) != _PHASES
++    ):
++        raise _InvalidTrajectory(
++            "invalid_anchors",
++            "Supply an immutable tuple of wind-down, sleeping, waking, return-to-day and daytime anchors.",
++        )
++    points = []
++    for anchor in anchors:
++        at = _utc(anchor.at, f"{anchor.phase} anchor")
++        floor = _number(anchor.floor_f, "floor_f", "invalid_band")
++        ceiling = _number(anchor.ceiling_f, "ceiling_f", "invalid_band")
++        _check_band(floor, ceiling, minimum, maximum, width)
++        points.append(_Point(at, floor, ceiling, anchor.phase))
++
++    for left, right in pairwise(points):
++        elapsed = (right.at - left.at) // _MICROSECOND
++        if elapsed <= 0:
++            raise _InvalidTrajectory(
++                "invalid_anchors", "Anchor instants must be strictly increasing after UTC conversion."
++            )
++        changes = (right.floor - left.floor, right.ceiling - left.ceiling)
++        if (
++            (left.phase == "wind_down" and any(change > 0 for change in changes))
++            or (left.phase == "sleeping" and any(change != 0 for change in changes))
++            or (left.phase == "waking" and any(change < 0 for change in changes))
++        ):
++            raise _InvalidTrajectory(
++                "phase_direction", "Wind-down cannot warm, sleep must hold, and waking cannot cool."
++            )
++        if any(abs(change) * _HOUR_MICROSECONDS > rate * elapsed for change in changes):
++            raise _InvalidTrajectory("rate_exceeded", "A band edge would exceed the approved rate over elapsed time.")
++    return tuple(points), minimum, maximum, width
++
++
++def preview_trajectory(config: SleepTrajectory, *, now: datetime) -> TrajectoryPreview:
++    """Evaluate one approved dated curve without affecting any other component.
++
++    Disabled/unapproved routines expose no band. All anchors are validated before
++    a result is returned, even when the invalid anchor lies after ``now``. Phases
++    are half-open intervals; the final anchor is included, with no extrapolation
++    beyond it. UTC arithmetic distinguishes repeated DST instants but does not
++    resolve ambiguous/nonexistent local schedule times for a caller.
++    """
++    try:
++        if (
++            not isinstance(config, SleepTrajectory)
++            or type(config.enabled) is not bool
++            or type(config.approved) is not bool
++        ):
++            raise _InvalidTrajectory("invalid_configuration", "Supply a SleepTrajectory with explicit boolean flags.")
++        if not config.enabled:
++            return TrajectoryPreview("disabled", "disabled", "Sleep/wake preview is disabled; no band is proposed.")
++        if not config.approved:
++            raise _InvalidTrajectory("unapproved", "The routine has not been approved; no band is proposed.")
++        instant = _utc(now, "Evaluation time")
++        points, minimum, maximum, width = _validate(config)
++        if not points[0].at <= instant <= points[-1].at:
++            raise _InvalidTrajectory(
++                "outside_horizon", "Evaluation is outside the approved dated routine; no extrapolation."
++            )
++
++        current = points[-1]
++        floor, ceiling = current.floor, current.ceiling
++        for left, right in pairwise(points):
++            if left.at <= instant < right.at:
++                fraction = Fraction((instant - left.at) // _MICROSECOND, (right.at - left.at) // _MICROSECOND)
++                floor = left.floor + fraction * (right.floor - left.floor)
++                ceiling = left.ceiling + fraction * (right.ceiling - left.ceiling)
++                current = left
++                break
++
++        floor_f, ceiling_f = float(floor), float(ceiling)
++        # Float presentation must not collapse a very narrow approved band. Withhold
++        # instead of widening it or pretending the rounded representation is valid.
++        _check_band(
++            _number(floor_f, "preview floor", "unrepresentable_preview"),
++            _number(ceiling_f, "preview ceiling", "unrepresentable_preview"),
++            minimum,
++            maximum,
++            width,
++            reason_code="unrepresentable_preview",
++        )
++        return TrajectoryPreview(
++            "preview",
++            "ready",
++            f"Approved {current.phase.replace('_', ' ')} band preview in Fahrenheit; "
++            "not a device target or mode request.",
++            floor_f,
++            ceiling_f,
++            current.phase,
++        )
++    except _InvalidTrajectory as error:
++        return TrajectoryPreview("withheld", error.reason_code, str(error))
+diff --git a/docs/adaptive-mode-preview.md b/docs/adaptive-mode-preview.md
+new file mode 100644
+--- /dev/null
++++ b/docs/adaptive-mode-preview.md
+@@ -0,0 +1,58 @@
++# Disconnected Adaptive Comfort mode model
++
++Experimental MIT contribution candidate, not a live Climate Advisor mode. The implemented module `custom_components/climate_advisor/adaptive_mode_preview.py` models selection, holds and logical hand-back for one zone. It must not import the existing engine, band calculator, timer resolver, HA, storage, clock or any command service. No production path imports it.
++
++## Assumptions and boundaries
++
++- Selecting Adaptive Comfort is an overlay on the ordinary policy, not destructive editing of its settings. A policy evaluation request identifies which policy to evaluate using **current** settings and evaluation time; it contains no captured target.
++- All requests/decisions permanently expose `commands_allowed=False`. They are not authorization tokens, dispatch proposals or proof of equipment safety. This model does not execute the selected policy, alter host automation flags or change a thermostat.
++- A caller supplies immutable host snapshots and explicit synthetic validity/approval evidence. `ready` is an input to this model, not an implementation of sensor, unit, equipment or safety validation. Device-specific P-series/M10 tests remain pending.
++- Each reconstructed per-zone lifecycle needs a fresh caller-supplied session ID, not shared with another zone. Generations increase on transitions that invalidate work. The caller must retain the returned state; using an obsolete state instead of current state is not supported. Nothing is persisted or automatically resumed here.
++- Host `owner_revision` advances for every manual target/mode/owner-selection change, including changes back to the same value. `settings_revision` advances on ordinary-policy edits; `routine_revision` advances on adaptive configuration edits. These are explicit fake-host assumptions, not existing Climate Advisor APIs or evidence that real HA events can be correlated reliably.
++- Ordinary settings edited while adaptive is selected are not rolled back. Such an edit invalidates old evaluation requests, but new hand-back requests reference current settings. A changed owner or ordinary policy selection instead establishes a manual/external hold.
++- When the overlay owns no selection, hold or pending return, it delegates ordinary evaluation without imposing its hold policy. Rejected enable during an existing host hold leaves ordinary behavior intact; an ordinary evaluation request is not permission to bypass the host's own guards.
++- No timeout, timer expiry, repeated enable, normal schedule refresh or recovered sensor can clear a hold latched by the adaptive lifecycle. Explicit resume requires reconciliation and valid current evidence; an ongoing external hold still blocks it.
++
++## Data and API
++
++- `HostPolicy`: ordinary `policy_id`, owner/settings revisions, and retained `automation_enabled=False`, `observe_only=True`, `external_hold=False` defaults. The reserved adaptive policy ID cannot stand in for the ordinary return policy.
++- `ModeInputs`: host snapshot, adaptive routine revision, `approved=False` and `ready=False` by default.
++- `ModeState`: required session ID; initially unselected, generation zero, no saved policy, hold or hand-back. Saved policy information is only a return reference; its old settings/permissions are never written back.
++- `ModeEvent`: event kind, originating session/generation, optional explicit reconciliation and matching hand-back request. Unknown/malformed/stale events are withheld.
++- `decide_mode(state, inputs, event)`: returns an immutable next state, reason/explanation and optional evaluation request. Invalid internal state raises `ValueError` instead of inventing a reset state; malformed live inputs invalidate work and latch reconciliation for an owned lifecycle. Explicit disable still deselects adaptive even when inputs are malformed; unresolved hand-back stays unknown, or a known manual hold is preserved.
++- `request_is_current(request, state, inputs)`: checks a request against the current session, generation, full input snapshot, selected policy and holds. This is a pure stale-work check, not atomic HA dispatch or a substitute for command expiry/safety checks. Requests do not cache a temperature or evaluation time; evaluate the named policy afresh when consuming one.
++
++## Transition contract
++
++| Event | Model behavior |
++| --- | --- |
++| `refresh` while never selected | Request the current ordinary policy unchanged; do not mutate settings or host permissions. |
++| `enable` | Require approval/readiness and no hold or pending hand-back. Save the ordinary policy reference once, select adaptive and invalidate earlier requests. Repeated valid enable is idempotent. |
++| `refresh` while selected | Request only adaptive evaluation; ordinary schedule/offset changes cannot become a second selected producer in this model. A changed routine revision, lost approval or invalid required input latches reconciliation. |
++| `manual_change` or changed ownership/ordinary policy while selected or returning | Latch manual hold and invalidate outstanding requests. No counter-request. Pending/unknown hand-back is abandoned in favor of the newer authority, not reported successful. |
++| `resume` | Require explicit reconciliation and absence of an external hold. If adaptive remains selected, validate approval/readiness and bind to the current ordinary policy/owner and routine revision. If disabled, return only to the current ordinary policy. Never enable host automation. |
++| `disable` while still owned and valid | Deselect adaptive first, invalidate earlier work, then request evaluation of the saved ordinary policy using its current snapshot. Mark logical hand-back pending, not completed. |
++| `disable` while held or superseded | Deselect without any restore request. Preserve a manual hold/newer authority; if reconciliation is needed instead, retain an unknown hand-back. Repeated disable cannot clear it. |
++| `handback_confirmed` | Only the matching current pending request can finish logical hand-back. No physical restoration is inferred. |
++| `handback_failed` | Only the matching request can mark the outcome unknown; no automatic retry or ordinary/adaptive fall-through. |
++| `retry_handback` | An unknown result may be retried only after explicit reconciliation, current readiness and unchanged ownership. Issue a new generation-bound request; never blindly replay the old one. |
++| `restart` during adaptive selection, hold or hand-back | Invalidate work and latch reconciliation (preserve an existing manual hold). Pending hand-back becomes unknown. A later refresh cannot resume automatically. No host restart code is changed. |
++| `manual_change` / `restart` / `resume` when the overlay owns nothing | Invalidate selector metadata, but leave the ordinary host's hold/startup policy alone; no new adaptive hold or settings change. |
++
++Input loss during a pending hand-back also makes it unknown. Changed ownership during hand-back retains the newer choice and blocks stale confirmation. An ordinary settings revision change rejects an old confirmation; it does not allow applying captured settings. Explicit reconciliation is required before a fresh hand-back request.
++
++## Test scope and remaining work
++
++The 101 cases in `tests/test_adaptive_mode_preview.py` exercise the real decision function, immutable fake host snapshots, independent ordinary/adaptive evaluators, and matched/mismatched outcome events. They cover current-time/current-settings evaluation on exit, no double producer in the selector, preserved disabled/observe-only permissions, stale session/generation/context rejection, manual/restart persistence and unknown outcomes without retry. The suite includes all 216 three-event sequences from six lifecycle event kinds, checking invariants and old-request rejection.
++
++Tests were written before the module and first failed at import. Additional review tests then exposed off-mode hold interference and incomplete disable behavior with invalid inputs; those failures were reproduced before correcting the model. All 101 cases now pass together with 147 band/timing cases and 196 existing regressions (444 total) on Python 3.14.5 / Windows. Scoped Ruff lint/format checks pass. The existing full-suite Windows `resource` blocker remains deferred, not skipped or patched; the HA tier was not run.
++
++Using the isolated unit tier described in [DEVELOPMENT.md](DEVELOPMENT.md):
++
++```sh
++python scripts/test.py unit tests/test_adaptive_mode_preview.py tests/test_sleep_timing.py tests/test_sleep_trajectory.py
++```
++
++This establishes only the synthetic decision portion of M01–M08 and outcome bookkeeping for M09. It does not establish real callback coverage, ownership detection, physical release, sensor freshness, quantization, command rate limits, HA atomicity, or any live M10/P-series requirement. Before a production selector, enumerate the host's classification, bedtime/wake, restore, savings/pre-cool, occupancy/away/vacation, ventilation, chart and remote-sensor consumers and agree feature precedence with maintainers. In particular, this model does not rewrite the host's deliberate manual-grace or startup policies.
++
++The ordinary host behavior remains unchanged because nothing imports this module. The browser demo remains independent. No Home Assistant installation, network access, hardware, dependency addition or golden-scenario change is needed for this slice.
+diff --git a/docs/sleep-trajectory-preview.md b/docs/sleep-trajectory-preview.md
+new file mode 100644
+--- /dev/null
++++ b/docs/sleep-trajectory-preview.md
+@@ -0,0 +1,73 @@
++# Disconnected sleep/wake trajectory preview
++
++**Local experimental slice, not wired into Climate Advisor.** The module `custom_components/climate_advisor/sleep_trajectory.py` calculates a proposed comfort band for one explicitly dated routine. No live planner, sensor, UI, chart, service call or persistent state imports it. Existing control behavior and configuration are unchanged; this is not a released feature or a sleep/comfort validation result.
++
++## Contract
++
++`preview_trajectory(config, *, now)` accepts a `SleepTrajectory` and an injected aware datetime. Configuration is immutable and disabled/unapproved by default. Enabling it does not imply approval. All temperatures use internal Fahrenheit; callers must not pass Celsius values without converting them at a separately validated boundary.
++
++An enabled, approved routine requires:
++
++- A `TrajectoryLimits` with explicit finite minimum/maximum temperatures, positive minimum band width and positive maximum per-edge rate in degrees Fahrenheit per hour. There are no household numeric defaults.
++- A tuple of exactly five `TrajectoryAnchor` records, with phases in this order: `wind_down`, `sleeping`, `waking`, `return_to_day`, `daytime`.
++- Strictly increasing, timezone-aware, dated anchor instants. These must already be resolved by the caller. The evaluator normalizes them to UTC for comparisons and elapsed arithmetic; it does not resolve ambiguous/nonexistent local clock times, repeat a schedule, infer a timezone or use the current clock.
++- Finite ordered floor/ceiling values at every anchor, inside the approved bounds and at least the declared minimum width apart.
++
++Both edges interpolate linearly. Wind-down may only decrease or hold; the sleeping interval holds both edges; waking may only increase or hold. The return-to-day interval may move in either direction within the same bounds/rate limits. The phase beginning at an anchor owns that instant. The final daytime anchor is included, but no values are extrapolated beyond the dated horizon.
++
++All anchors are checked before returning any preview, including anchors after the evaluation time. Invalid input is not clamped, reordered or repaired. Arithmetic uses rational values derived from the declared decimal numbers and exact elapsed microseconds, avoiding overflow in differences between extreme finite edges and preserving inclusive rate/width boundaries. Output floats are checked again; if representation would collapse the permitted band, the preview is withheld.
++
++## Fixed-wake local-time resolver
++
++`custom_components/climate_advisor/sleep_timing.py` now provides `LocalSleepTiming` and `resolve_sleep_timing(config, *, wake_date)`. It is also disconnected: no existing production module imports it. It resolves **one supplied date**, not a running recurring schedule, and has no temperature, approval, storage or command policy.
++
++All timing fields are explicit, with no defaults:
++
++| Field | Meaning |
++| --- | --- |
++| `timezone_key` | IANA timezone key; never inferred from the host |
++| `wind_down_start`, `sleep_start`, `wake_time` | Naive `datetime.time` values with `fold=0`; the resolver owns ambiguity policy |
++| `wind_down_day_offset`, `sleep_day_offset` | Exact integer -1 (previous date) or 0 (wake date); no inferred overnight wrap |
++| `warming_duration`, `return_duration` | Positive elapsed `timedelta` values |
++| Injected `wake_date` | A `date`, not a datetime or a clock read; the resolved wake starts `return_to_day` |
++
++Resolve wind-down, sleep start and wake into UTC first. Then subtract warming duration from wake and add return duration to wake in UTC. This preserves elapsed ramp lengths across clock changes. All five anchors must be strictly increasing; no sorting or compressing invalid intervals.
++
++- A repeated local time uses its earlier UTC occurrence, with an explanatory adjustment.
++- A nonexistent local time shifts forward by the actual offset gap, including non-hour gaps, with an explanation.
++- If that adjustment changes the requested calendar date (such as a skipped whole date), withhold instead of silently moving the routine to another date.
++- Missing/invalid timezone data, invalid dates/times/offsets/durations, overflow and overlapping phases return `withheld` with no partial anchors.
++
++`SleepTimingResolution` contains status, reason, explanation, immutable `TimingAnchor(at, phase)` records, adjustment messages and non-initializable `commands_allowed=False`. A resolved result does not approve or enable anything. Compose it with explicit bands/limits/flags and call `preview_trajectory()`; the combined tests show a correctly ordered spring-forward routine still being withheld when its shortened wind-down exceeds the rate limit.
++
++Timezone data comes from Python's `zoneinfo`: system IANA data or its `tzdata` fallback. The existing locked Windows unit environment uses `tzdata` 2026.6; no new dependency was installed. Tests do not skip missing-zone cases; runtime resolution explains unavailable data without downloading it. Timezone-data versions are part of reproducibility.
++
++There is no current-night selection, adjacent-date overlap resolution, scheduled callback, daylight input, cache invalidation or command replay prevention here. A future adapter must resolve again when the timezone/configuration/date changes and independently invalidate outstanding proposals. Repeated-time arithmetic tests are not proof of a scheduler firing only once.
++
++## Results and boundaries
++
++`TrajectoryPreview` has `status`, `reason_code`, `explanation`, optional `floor_f`, `ceiling_f` and `phase`, and a non-initializable `commands_allowed=False` field.
++
++| Status | Meaning |
++| --- | --- |
++| `disabled` | Feature off; no band, no schedule evaluation required |
++| `withheld` | No approved/valid preview, or evaluation outside the dated horizon; no band |
++| `preview` | Valid mathematical band and phase, not a thermostat command or an achieved indoor condition |
++
++Withheld reasons distinguish unapproved/invalid configuration, invalid limits, anchors, times or bands, wrong phase direction, excessive rate, out-of-horizon evaluation, and unrepresentable output. Neither a valid result nor the boolean field is an authorization mechanism for a future dispatcher. This module has no such dispatcher.
++
++Not implemented: device-step quantization, choosing/changing HVAC mode, sensor freshness, manual override or restart reconciliation, a recurring schedule executor, daylight, weather offsets, thermal response, or control. Those require separate policy/integration work. In particular, a higher cooling setpoint can permit passive warming; it does not authorize heating or prove a room has warmed.
++
++## Test fixture and validation
++
++The tests use an arbitrary 60–80°F envelope, a 4°F minimum band width and a 2.5°F/hour per-edge maximum. The overnight floor/ceiling anchors are 68/74 → 64/70 → 64/70 → 69/75 → 68/74°F at 22:00, 00:00, 05:00, 07:00 and 09:00 UTC. These values are arithmetic examples, not recommended temperatures or equipment-safety defaults.
++
++Using the upstream unit-test environment described in [DEVELOPMENT.md](DEVELOPMENT.md):
++
++```sh
++python scripts/test.py unit tests/test_sleep_timing.py tests/test_sleep_trajectory.py
++```
++
++The tests cover off/unapproved behavior, anchors and intermediate points, minute-by-minute bounds/rates, deterministic sampling, UTC/offset equivalence, already-resolved DST gap/fold instants, malformed inputs, phase directions, extreme finite inputs and float representation. A structural test checks standard-library-only imports and that no other integration module references the calculator.
++
++The current checkpoint was tested on Python 3.14.5 / Windows with 70 timing cases, 77 band-preview cases, 101 separate [mode-model cases](adaptive-mode-preview.md) and 196 existing band/target/gate/restore/startup/observe-only cases passing together (444 total). The mode model is not a live consumer of these calculators. The timing tests were written first and initially failed because the new module did not exist. They cover overnight/year/leap-date boundaries, gap/fold resolution, non-hour gaps, elapsed ramps, skipped dates, invalid inputs, immutability, and composition without bypassing approval or slope limits. Ruff check and format checks pass for the new Python files. A pre-change full unit run was blocked during collection by existing imports of Unix-only `resource` in `tools/sim_harness/replay.py`, reached by `tests/test_nightly_ledger.py` and `tests/test_sim_generator.py`. That limitation was not patched or hidden by changing the suite. The real-HA tier and live equipment were not run.
+diff --git a/tests/test_adaptive_mode_preview.py b/tests/test_adaptive_mode_preview.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_adaptive_mode_preview.py
+@@ -0,0 +1,563 @@
++# SPDX-License-Identifier: MIT
++"""Synthetic ownership/selection tests, not Climate Advisor callback or HVAC tests."""
++
++from __future__ import annotations
++
++import ast
++from dataclasses import FrozenInstanceError, replace
++from datetime import UTC, datetime
++from itertools import product
++from pathlib import Path
++
++import pytest
++
++from custom_components.climate_advisor import adaptive_mode_preview
++from custom_components.climate_advisor.adaptive_mode_preview import (
++    ADAPTIVE_POLICY,
++    HostPolicy,
++    ModeDecision,
++    ModeEvent,
++    ModeInputs,
++    ModeRequest,
++    ModeState,
++    decide_mode,
++    request_is_current,
++)
++
++
++def inputs(**changes):
++    return replace(
++        ModeInputs(
++            host=HostPolicy("schedule", owner_revision=1, settings_revision=1),
++            routine_revision=1,
++            approved=True,
++            ready=True,
++        ),
++        **changes,
++    )
++
++
++def host_changed(data, **changes):
++    return replace(data, host=replace(data.host, **changes))
++
++
++def send(state, kind, data, **changes):
++    event = ModeEvent(kind, state.session_id, state.generation, **changes)
++    return decide_mode(state, data, event)
++
++
++def enabled(data=None):
++    return send(ModeState("session-1"), "enable", inputs() if data is None else data)
++
++
++def pending(data=None):
++    data = inputs() if data is None else data
++    return send(enabled(data).state, "disable", data)
++
++
++class FakePolicies:
++    """Independent arithmetic evaluators; neither one implements mode selection."""
++
++    def __init__(self):
++        self.calls = []
++        self.evaluators = {"schedule": self.ordinary, "holiday": self.ordinary, ADAPTIVE_POLICY: self.adaptive}
++
++    @staticmethod
++    def ordinary(now, data):
++        floor = (68 if now.hour < 12 else 74) + data.host.settings_revision
++        return floor, floor + 6
++
++    @staticmethod
++    def adaptive(now, data):
++        return 64, 70
++
++    def consume(self, request, state, data, *, now):
++        if not request_is_current(request, state, data):
++            return None
++        self.calls.append(request.policy_id)
++        return self.evaluators[request.policy_id](now, data)
++
++
++def test_m01_never_selected_delegates_to_unchanged_ordinary_policy():
++    data = inputs(approved=False, ready=False)
++    state = ModeState("session-1")
++    result = send(state, "refresh", data)
++    now = datetime(2026, 1, 2, 9, tzinfo=UTC)
++    fake = FakePolicies()
++    assert result.state == state
++    assert result.request.kind == "ordinary"
++    assert fake.consume(result.request, state, data, now=now) == fake.ordinary(now, data)
++    assert result.commands_allowed is False
++
++
++def test_m02_enable_is_explicit_idempotent_and_does_not_mutate_settings():
++    data = inputs()
++    before = repr(data)
++    first = enabled(data)
++    second = send(first.state, "enable", data)
++    assert first.state.selected is True
++    assert first.state.previous == data.host
++    assert first.state.generation == 1
++    assert second.state == first.state
++    assert second.request.policy_id == ADAPTIVE_POLICY
++    assert repr(data) == before
++    assert data.host.automation_enabled is False and data.host.observe_only is True
++
++
++@pytest.mark.parametrize("producer", ["bedtime", "wakeup", "preset", "comfort_offset"])
++def test_m03_ordinary_refresh_cannot_replace_or_stack_selected_adaptive_policy(producer):
++    data = inputs()
++    state = enabled(data).state
++    changed = host_changed(data, settings_revision=2)
++    result = send(state, "refresh", changed)
++    fake = FakePolicies()
++    assert fake.consume(result.request, result.state, changed, now=datetime(2026, 1, 2, tzinfo=UTC)) == (64, 70), (
++        producer
++    )
++    assert fake.calls == [ADAPTIVE_POLICY]
++    assert result.state.previous == data.host
++
++
++def test_m04_disable_evaluates_current_time_and_settings_not_a_captured_target():
++    data = inputs()
++    fake = FakePolicies()
++    start = datetime(2026, 1, 1, 22, tzinfo=UTC)
++    finish = datetime(2026, 1, 2, 9, tzinfo=UTC)
++    assert fake.ordinary(start, data) == (75, 81)
++    active = enabled(data)
++    changed = host_changed(data, settings_revision=2)
++    result = send(active.state, "disable", changed)
++    assert result.state.selected is False
++    assert result.state.handback == "pending"
++    assert result.request.kind == "handback"
++    assert result.request.policy_id == "schedule"
++    assert result.request.inputs.host.settings_revision == 2
++    assert fake.consume(result.request, result.state, changed, now=finish) == (70, 76)
++    assert not request_is_current(active.request, result.state, changed)
++    assert send(result.state, "refresh", changed).request is None
++    confirmed = send(result.state, "handback_confirmed", changed, request=result.request)
++    assert confirmed.state.handback == "none"
++    assert confirmed.state.previous is None
++    assert confirmed.request is None
++    assert send(confirmed.state, "refresh", changed).request.policy_id == "schedule"
++
++
++@pytest.mark.parametrize("change", [{"owner_revision": 2}, {"policy_id": "holiday"}, {"external_hold": True}])
++def test_m05_newer_authority_prevents_restore_on_disable(change):
++    data = inputs()
++    active = enabled(data)
++    changed = host_changed(data, **change)
++    result = send(active.state, "disable", changed)
++    assert result.state.selected is False
++    assert result.state.hold == "manual"
++    assert result.state.previous is None
++    assert result.request is None
++    assert not request_is_current(active.request, result.state, changed)
++    assert send(result.state, "disable", changed).state == result.state
++
++
++@pytest.mark.parametrize(("automation_enabled", "observe_only"), list(product((False, True), repeat=2)))
++def test_m06_host_permissions_are_retained_and_never_grant_commands(automation_enabled, observe_only):
++    data = host_changed(inputs(), automation_enabled=automation_enabled, observe_only=observe_only)
++    active = enabled(data)
++    result = send(active.state, "disable", data)
++    for decision in (active, result):
++        assert decision.commands_allowed is False
++        assert decision.request.commands_allowed is False
++        assert decision.request.inputs.host == data.host
++    confirmed = send(result.state, "handback_confirmed", data, request=result.request)
++    ordinary = send(confirmed.state, "refresh", data)
++    assert ordinary.request.inputs.host.automation_enabled is automation_enabled
++    assert ordinary.request.inputs.host.observe_only is observe_only
++
++
++def test_newer_permission_change_is_not_overwritten_by_saved_permissions():
++    data = host_changed(inputs(), automation_enabled=True, observe_only=False)
++    active = enabled(data)
++    changed = host_changed(data, automation_enabled=False, observe_only=True)
++    result = send(active.state, "disable", changed)
++    assert result.request.inputs.host == changed.host
++    assert result.state.previous == data.host
++
++
++@pytest.mark.parametrize(("changes", "reason"), [({"approved": False}, "unapproved"), ({"ready": False}, "not_ready")])
++def test_m07_invalid_enable_does_not_select_or_fall_through(changes, reason):
++    result = enabled(inputs(**changes))
++    assert result.state.selected is False
++    assert result.state.previous is None
++    assert result.reason_code == reason
++    assert result.request is None
++
++
++def test_rejected_enable_does_not_take_over_the_ordinary_hosts_hold_policy():
++    held = host_changed(inputs(), external_hold=True)
++    rejected = enabled(held)
++    assert rejected.state == ModeState("session-1")
++    assert rejected.request is None
++    ordinary = send(rejected.state, "refresh", held)
++    assert ordinary.request.kind == "ordinary"
++    assert ordinary.request.inputs.host.external_hold is True
++    assert request_is_current(ordinary.request, ordinary.state, held)
++    recovered = inputs()
++    assert send(rejected.state, "refresh", recovered).request.kind == "ordinary"
++    assert send(rejected.state, "enable", recovered).request.kind == "adaptive"
++
++
++@pytest.mark.parametrize("event", ["refresh", "manual_change", "restart"])
++def test_off_mode_does_not_latch_its_own_hold_over_the_ordinary_host(event):
++    data = host_changed(inputs(approved=False, ready=False), external_hold=True)
++    result = send(ModeState("session-1"), event, data)
++    assert result.state.hold == "none" and not result.state.selected
++    ordinary = send(result.state, "refresh", data)
++    assert ordinary.request.kind == "ordinary"
++    assert request_is_current(ordinary.request, ordinary.state, data)
++    assert ordinary.request.inputs.host == data.host
++
++
++def test_active_manual_hold_cannot_resume_while_external_hold_still_exists():
++    data = inputs()
++    held = send(enabled(data).state, "manual_change", data)
++    external = host_changed(data, external_hold=True)
++    result = send(held.state, "resume", external, reconciled=True)
++    assert result.state.hold == "manual" and result.request is None
++    assert send(result.state, "refresh", data).request is None
++
++
++@pytest.mark.parametrize("changes", [{"approved": False}, {"ready": False}, {"routine_revision": 2}])
++def test_lost_approval_readiness_or_routine_revision_latches_reconciliation(changes):
++    data = inputs()
++    active = enabled(data)
++    changed = replace(data, **changes)
++    blocked = send(active.state, "refresh", changed)
++    assert blocked.state.hold == "reconcile"
++    assert blocked.request is None
++    assert not request_is_current(active.request, blocked.state, data)
++    assert send(blocked.state, "refresh", data).request is None
++    assert send(blocked.state, "enable", data).request is None
++    resumed = send(blocked.state, "resume", data, reconciled=True)
++    assert resumed.state.hold == "none"
++    assert resumed.request.kind == "adaptive"
++
++
++@pytest.mark.parametrize("changes", [{"approved": False}, {"ready": False}])
++def test_resume_requires_valid_current_evidence(changes):
++    data = inputs()
++    held = send(enabled(data).state, "manual_change", data)
++    result = send(held.state, "resume", replace(data, **changes), reconciled=True)
++    assert result.state.hold != "none" and result.request is None
++
++
++def test_manual_hold_survives_refresh_enable_disable_and_only_explicit_resume_clears_it():
++    data = inputs()
++    held = send(enabled(data).state, "manual_change", data)
++    for kind in ("refresh", "enable"):
++        assert send(held.state, kind, data).request is None
++    disabled = send(held.state, "disable", data)
++    assert not disabled.state.selected
++    assert disabled.state.hold == "manual"
++    assert send(disabled.state, "refresh", data).request is None
++    changed = host_changed(data, policy_id="holiday", owner_revision=2)
++    resumed = send(disabled.state, "resume", changed, reconciled=True)
++    assert resumed.request.policy_id == "holiday"
++    assert resumed.state.previous is None
++
++
++def test_resume_selected_mode_rebinds_to_current_owner_not_obsolete_return_policy():
++    data = inputs()
++    changed = host_changed(data, policy_id="holiday", owner_revision=2)
++    held = send(enabled(data).state, "refresh", changed)
++    resumed = send(held.state, "resume", changed, reconciled=True)
++    assert resumed.state.previous == changed.host
++    assert resumed.request.policy_id == ADAPTIVE_POLICY
++    result = send(resumed.state, "disable", changed)
++    assert result.request.policy_id == "holiday"
++
++
++def test_m08_stale_event_cannot_reenable_after_disable():
++    data = inputs()
++    active = enabled(data)
++    old_event = ModeEvent("enable", active.state.session_id, active.state.generation)
++    disabled = send(active.state, "disable", data)
++    result = decide_mode(disabled.state, data, old_event)
++    assert result.reason_code == "stale_event"
++    assert result.state == disabled.state and result.request is None
++
++
++def test_new_session_invalidates_requests_even_if_generation_and_inputs_match():
++    data = inputs()
++    old = enabled(data)
++    new = send(ModeState("session-2"), "enable", data)
++    assert new.state.generation == old.state.generation
++    assert not request_is_current(old.request, new.state, data)
++    stale = ModeEvent("enable", old.state.session_id, old.state.generation)
++    assert decide_mode(new.state, data, stale).reason_code == "stale_event"
++
++
++def test_restart_invalidates_work_and_never_resumes_on_refresh():
++    data = inputs()
++    active = enabled(data)
++    result = send(active.state, "restart", data)
++    assert result.state.generation > active.state.generation
++    assert result.state.hold == "reconcile" and result.request is None
++    assert not request_is_current(active.request, result.state, data)
++    assert send(result.state, "refresh", data).request is None
++    assert send(result.state, "resume", data).request is None
++    assert send(result.state, "resume", data, reconciled=True).request.kind == "adaptive"
++
++
++def test_restart_preserves_manual_hold():
++    data = inputs()
++    held = send(enabled(data).state, "manual_change", data)
++    result = send(held.state, "restart", data)
++    assert result.state.hold == "manual"
++    assert send(result.state, "refresh", data).request is None
++
++
++def test_m09_failed_handback_is_unknown_not_completed_and_never_retried_automatically():
++    data = inputs()
++    handback = pending(data)
++    result = send(handback.state, "handback_failed", data, request=handback.request)
++    assert result.state.handback == "unknown"
++    assert result.state.previous is not None
++    assert result.request is None
++    assert result.state.pending_request is None
++    for kind in ("refresh", "enable", "disable", "resume", "retry_handback"):
++        blocked = send(result.state, kind, data)
++        assert blocked.request is None
++        assert blocked.state.handback == "unknown"
++    retried = send(result.state, "retry_handback", data, reconciled=True)
++    assert retried.state.handback == "pending"
++    assert retried.request.generation > handback.request.generation
++    stale = send(retried.state, "handback_confirmed", data, request=handback.request)
++    assert stale.request is None and stale.state.handback == "pending"
++    confirmed = send(retried.state, "handback_confirmed", data, request=retried.request)
++    assert confirmed.state.handback == "none"
++
++
++@pytest.mark.parametrize("kind", ["handback_confirmed", "handback_failed"])
++def test_unmatched_or_absent_handback_report_cannot_change_state(kind):
++    data = inputs()
++    handback = pending(data)
++    for request in (None, enabled(data).request, replace(handback.request, generation=0)):
++        result = send(handback.state, kind, data, request=request)
++        assert result.state == handback.state
++        assert result.reason_code == "stale_handback"
++
++
++@pytest.mark.parametrize("event", ["manual_change", "restart"])
++def test_pending_handback_cannot_complete_after_invalidation(event):
++    data = inputs()
++    handback = pending(data)
++    invalidated = send(handback.state, event, data)
++    result = send(invalidated.state, "handback_confirmed", data, request=handback.request)
++    assert result.state == invalidated.state
++    assert result.request is None
++    assert invalidated.state.handback == ("none" if event == "manual_change" else "unknown")
++
++
++def test_new_ordinary_settings_invalidate_pending_confirmation_and_require_fresh_handback():
++    data = inputs()
++    handback = pending(data)
++    changed = host_changed(data, settings_revision=2)
++    result = send(handback.state, "handback_confirmed", changed, request=handback.request)
++    assert result.state.handback == "unknown"
++    assert result.request is None
++    retried = send(result.state, "retry_handback", changed, reconciled=True)
++    assert retried.request.inputs.host.settings_revision == 2
++    assert request_is_current(retried.request, retried.state, changed)
++
++
++def test_new_owner_during_handback_is_preserved_instead_of_restored():
++    data = inputs()
++    handback = pending(data)
++    changed = host_changed(data, owner_revision=2)
++    result = send(handback.state, "handback_confirmed", changed, request=handback.request)
++    assert result.state.hold == "manual"
++    assert result.state.handback == "none" and result.state.previous is None
++    assert result.request is None
++    assert send(result.state, "retry_handback", changed, reconciled=True).request is None
++
++
++def test_input_loss_during_handback_is_unknown_and_cannot_be_confirmed_later():
++    data = inputs()
++    handback = pending(data)
++    result = send(handback.state, "refresh", replace(data, ready=False))
++    assert result.state.handback == "unknown"
++    assert result.state.hold == "reconcile"
++    assert send(result.state, "handback_confirmed", data, request=handback.request).state == result.state
++    assert send(result.state, "retry_handback", replace(data, ready=False), reconciled=True).request is None
++
++
++@pytest.mark.parametrize(
++    "change",
++    [
++        {"owner_revision": 2},
++        {"settings_revision": 2},
++        {"policy_id": "holiday"},
++        {"automation_enabled": True},
++        {"observe_only": False},
++        {"external_hold": True},
++    ],
++)
++def test_outstanding_request_rejects_changed_host_context(change):
++    data = inputs()
++    active = enabled(data)
++    assert not request_is_current(active.request, active.state, host_changed(data, **change))
++
++
++@pytest.mark.parametrize("change", [{"routine_revision": 2}, {"approved": False}, {"ready": False}])
++def test_outstanding_request_rejects_changed_routine_context(change):
++    data = inputs()
++    active = enabled(data)
++    assert not request_is_current(active.request, active.state, replace(data, **change))
++
++
++@pytest.mark.parametrize("field", ["approved", "ready"])
++@pytest.mark.parametrize("value", [1, "true", None])
++def test_evidence_flags_are_not_coerced(field, value):
++    data = inputs(**{field: value})
++    result = send(enabled().state, "refresh", data)
++    assert result.reason_code == "invalid_inputs"
++    assert result.state.hold == "reconcile" and result.request is None
++
++
++@pytest.mark.parametrize("field", ["automation_enabled", "observe_only", "external_hold"])
++@pytest.mark.parametrize("value", [1, "false", None])
++def test_host_flags_are_not_coerced(field, value):
++    result = send(enabled().state, "refresh", host_changed(inputs(), **{field: value}))
++    assert result.reason_code == "invalid_inputs" and result.request is None
++
++
++@pytest.mark.parametrize("field", ["owner_revision", "settings_revision"])
++@pytest.mark.parametrize("value", [-1, True, "1"])
++def test_host_revisions_are_nonnegative_exact_integers(field, value):
++    result = send(enabled().state, "refresh", host_changed(inputs(), **{field: value}))
++    assert result.reason_code == "invalid_inputs" and result.request is None
++
++
++@pytest.mark.parametrize("value", [-1, True, "1"])
++def test_routine_revision_is_a_nonnegative_exact_integer(value):
++    result = send(enabled().state, "refresh", inputs(routine_revision=value))
++    assert result.reason_code == "invalid_inputs" and result.request is None
++
++
++@pytest.mark.parametrize("policy_id", [None, "", " ", ADAPTIVE_POLICY, 1])
++def test_ordinary_policy_identity_cannot_be_missing_or_the_adaptive_overlay(policy_id):
++    result = send(enabled().state, "refresh", host_changed(inputs(), policy_id=policy_id))
++    assert result.reason_code == "invalid_inputs" and result.request is None
++
++
++@pytest.mark.parametrize("data", [None, {}, ModeInputs(host=None)])
++def test_malformed_input_cannot_reset_to_an_ordinary_fallback(data):
++    result = send(enabled().state, "refresh", data)
++    assert result.state.selected is True
++    assert result.state.hold == "reconcile" and result.request is None
++
++
++@pytest.mark.parametrize(
++    "event",
++    [
++        None,
++        {},
++        ModeEvent("anything", "session-1", 1),
++        ModeEvent("refresh", "session-1", True),
++        ModeEvent("resume", "session-1", 1, reconciled="yes"),
++    ],
++)
++def test_malformed_event_does_not_mutate_state(event):
++    active = enabled()
++    result = decide_mode(active.state, inputs(), event)
++    assert result.reason_code == "invalid_event"
++    assert result.state == active.state and result.request is None
++
++
++@pytest.mark.parametrize(
++    "state",
++    [
++        None,
++        {},
++        ModeState(""),
++        ModeState("session-1", generation=True),
++        ModeState("session-1", selected=True),
++        ModeState("session-1", hold="unknown"),
++        ModeState("session-1", handback="pending"),
++    ],
++)
++def test_invalid_internal_state_is_not_silently_reset(state):
++    with pytest.raises(ValueError):
++        decide_mode(state, inputs(), ModeEvent("refresh", "session-1", 0))
++    assert request_is_current(enabled().request, state, inputs()) is False
++
++
++@pytest.mark.parametrize("data", [None, inputs(ready=False)])
++def test_disable_stops_selection_even_when_current_inputs_are_unusable(data):
++    active = enabled()
++    result = send(active.state, "disable", data)
++    assert not result.state.selected
++    assert result.state.hold == "reconcile"
++    assert result.state.handback == "unknown"
++    assert result.request is None
++    assert not request_is_current(active.request, result.state, inputs())
++    assert send(result.state, "refresh", inputs()).request is None
++    retried = send(result.state, "retry_handback", inputs(), reconciled=True)
++    assert retried.request.kind == "handback"
++
++
++def test_manual_change_remains_manual_even_with_malformed_inputs():
++    active = enabled()
++    result = send(active.state, "manual_change", None)
++    assert result.state.hold == "manual" and result.request is None
++    disabled = send(result.state, "disable", None)
++    assert not disabled.state.selected
++    assert disabled.state.hold == "manual"
++    assert disabled.state.handback == "none"
++
++
++def test_unknown_handback_cannot_coexist_with_superseding_manual_authority():
++    state = ModeState("session-1", previous=inputs().host, hold="manual", handback="unknown")
++    with pytest.raises(ValueError):
++        send(state, "retry_handback", inputs(), reconciled=True)
++
++
++def test_decisions_and_requests_cannot_be_mutated_or_initialized_with_command_permission():
++    result = enabled()
++    with pytest.raises(FrozenInstanceError):
++        result.state.selected = False
++    with pytest.raises(FrozenInstanceError):
++        result.request.inputs.host.policy_id = "holiday"
++    with pytest.raises(TypeError):
++        ModeDecision(result.state, "test", "test", commands_allowed=True)
++    with pytest.raises(TypeError):
++        ModeRequest("adaptive", ADAPTIVE_POLICY, "session-1", 1, inputs(), commands_allowed=True)
++
++
++def test_short_event_sequences_preserve_state_invariants_and_invalidate_old_requests():
++    data = inputs()
++    for sequence in product(("enable", "refresh", "disable", "manual_change", "restart", "resume"), repeat=3):
++        state = ModeState("session-1")
++        previous = []
++        for kind in sequence:
++            result = send(state, kind, data, reconciled=(kind == "resume"))
++            state = result.state
++            assert result.commands_allowed is False
++            for request in previous:
++                if request.generation != state.generation:
++                    assert not request_is_current(request, state, data)
++            if result.request:
++                assert request_is_current(result.request, state, data), sequence
++                assert result.request.commands_allowed is False
++                previous.append(result.request)
++
++
++def test_model_is_standard_library_only_and_has_no_live_importers():
++    path = Path(adaptive_mode_preview.__file__)
++    tree = ast.parse(path.read_text(encoding="utf-8"))
++    allowed = {"__future__", "dataclasses", "typing"}
++    for node in ast.walk(tree):
++        if isinstance(node, ast.ImportFrom):
++            assert not node.level and node.module in allowed
++        elif isinstance(node, ast.Import):
++            assert all(alias.name in allowed for alias in node.names)
++    for other in path.parent.glob("*.py"):
++        if other != path:
++            assert "adaptive_mode_preview" not in other.read_text(encoding="utf-8"), other.name
+diff --git a/tests/test_sleep_timing.py b/tests/test_sleep_timing.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_sleep_timing.py
+@@ -0,0 +1,303 @@
++# SPDX-License-Identifier: MIT
++"""Dated local-time resolution, not a scheduler or a hardware-control test."""
++
++from __future__ import annotations
++
++import ast
++from dataclasses import FrozenInstanceError, replace
++from datetime import UTC, date, datetime, time, timedelta
++from pathlib import Path
++from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
++
++import pytest
++
++from custom_components.climate_advisor import sleep_timing
++from custom_components.climate_advisor.sleep_timing import LocalSleepTiming, resolve_sleep_timing
++from custom_components.climate_advisor.sleep_trajectory import (
++    SleepTrajectory,
++    TrajectoryAnchor,
++    TrajectoryLimits,
++    preview_trajectory,
++)
++
++WAKE_DATE = date(2026, 1, 2)
++
++
++def timing(**changes):
++    return replace(
++        LocalSleepTiming(
++            timezone_key="UTC",
++            wind_down_start=time(22),
++            wind_down_day_offset=-1,
++            sleep_start=time(0),
++            sleep_day_offset=0,
++            wake_time=time(7),
++            warming_duration=timedelta(hours=2),
++            return_duration=timedelta(hours=2),
++        ),
++        **changes,
++    )
++
++
++def trajectory(result, **flags):
++    assert result.status == "resolved"
++    bands = ((68, 74), (64, 70), (64, 70), (69, 75), (68, 74))
++    config = SleepTrajectory(
++        enabled=True,
++        approved=True,
++        limits=TrajectoryLimits(60, 80, 4, 2.5),
++        anchors=tuple(
++            TrajectoryAnchor(anchor.at, floor, ceiling, anchor.phase)
++            for anchor, (floor, ceiling) in zip(result.anchors, bands, strict=True)
++        ),
++    )
++    return replace(config, **flags)
++
++
++def assert_withheld(result, reason):
++    assert result.status == "withheld"
++    assert result.reason_code == reason
++    assert result.anchors == ()
++    assert result.adjustments == ()
++    assert result.commands_allowed is False
++    assert result.explanation
++
++
++def test_utc_night_matches_existing_arithmetic_fixture():
++    result = resolve_sleep_timing(timing(), wake_date=WAKE_DATE)
++    assert result.status == "resolved"
++    assert result.reason_code == "ready"
++    assert result.commands_allowed is False
++    assert result.adjustments == ()
++    assert [(a.at, a.phase) for a in result.anchors] == [
++        (datetime(2026, 1, 1, 22, tzinfo=UTC), "wind_down"),
++        (datetime(2026, 1, 2, 0, tzinfo=UTC), "sleeping"),
++        (datetime(2026, 1, 2, 5, tzinfo=UTC), "waking"),
++        (datetime(2026, 1, 2, 7, tzinfo=UTC), "return_to_day"),
++        (datetime(2026, 1, 2, 9, tzinfo=UTC), "daytime"),
++    ]
++    preview = preview_trajectory(trajectory(result), now=datetime(2026, 1, 2, 6, tzinfo=UTC))
++    assert (preview.floor_f, preview.ceiling_f) == (66.5, 72.5)
++
++
++def test_explicit_zone_not_host_zone_and_no_implicit_wake_date():
++    config = timing(timezone_key="America/New_York")
++    result = resolve_sleep_timing(config, wake_date=WAKE_DATE)
++    assert result.anchors[0].at == datetime(2026, 1, 2, 3, tzinfo=UTC)
++    assert result.anchors[3].at == datetime(2026, 1, 2, 12, tzinfo=UTC)
++    assert resolve_sleep_timing(config, wake_date=WAKE_DATE) == result
++    with pytest.raises(TypeError):
++        resolve_sleep_timing(config)
++
++
++def test_bedtime_after_midnight_belongs_to_supplied_wake_date():
++    result = resolve_sleep_timing(
++        timing(wind_down_start=time(0), wind_down_day_offset=0, sleep_start=time(1)), wake_date=WAKE_DATE
++    )
++    assert result.status == "resolved"
++    assert all(a.at.date() == WAKE_DATE for a in result.anchors)
++
++
++@pytest.mark.parametrize("wake_date", [date(2026, 1, 1), date(2024, 3, 1), date(2026, 3, 1)])
++def test_prior_evening_uses_calendar_arithmetic(wake_date):
++    result = resolve_sleep_timing(timing(), wake_date=wake_date)
++    assert result.status == "resolved"
++    assert result.anchors[0].at.date() == wake_date - timedelta(days=1)
++
++
++def test_spring_gap_advances_by_gap_and_records_adjustment():
++    result = resolve_sleep_timing(
++        timing(timezone_key="America/New_York", sleep_start=time(2, 30)), wake_date=date(2026, 3, 8)
++    )
++    assert result.status == "resolved"
++    assert result.anchors[1].at == datetime(2026, 3, 8, 7, 30, tzinfo=UTC)
++    assert any("gap" in message.lower() for message in result.adjustments)
++
++
++def test_fall_fold_uses_earlier_instant_and_records_adjustment():
++    result = resolve_sleep_timing(
++        timing(timezone_key="America/New_York", sleep_start=time(1, 30)), wake_date=date(2026, 11, 1)
++    )
++    assert result.status == "resolved"
++    assert result.anchors[1].at == datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
++    assert any("fold" in message.lower() for message in result.adjustments)
++    config = trajectory(result)
++    for hour in (5, 6):
++        preview = preview_trajectory(config, now=datetime(2026, 11, 1, hour, 30, tzinfo=UTC))
++        assert preview.phase == "sleeping"
++        assert preview.commands_allowed is False
++
++
++def test_half_hour_gap_is_not_assumed_to_be_one_hour():
++    result = resolve_sleep_timing(
++        timing(timezone_key="Australia/Lord_Howe", sleep_start=time(2, 15)), wake_date=date(2026, 10, 4)
++    )
++    assert result.status == "resolved"
++    assert result.anchors[1].at == datetime(2026, 10, 3, 15, 45, tzinfo=UTC)
++    local = result.anchors[1].at.astimezone(ZoneInfo("Australia/Lord_Howe"))
++    assert (local.hour, local.minute) == (2, 45)
++
++
++@pytest.mark.parametrize(
++    ("wake_date", "wake_time", "expected_wake"),
++    [
++        (date(2026, 3, 8), time(2, 30), datetime(2026, 3, 8, 7, 30, tzinfo=UTC)),
++        (date(2026, 11, 1), time(3, 30), datetime(2026, 11, 1, 8, 30, tzinfo=UTC)),
++    ],
++)
++def test_ramps_keep_elapsed_durations_across_clock_changes(wake_date, wake_time, expected_wake):
++    result = resolve_sleep_timing(timing(timezone_key="America/New_York", wake_time=wake_time), wake_date=wake_date)
++    assert result.status == "resolved"
++    assert result.anchors[3].at == expected_wake
++    assert result.anchors[3].at - result.anchors[2].at == timedelta(hours=2)
++    assert result.anchors[4].at - result.anchors[3].at == timedelta(hours=2)
++    assert preview_trajectory(trajectory(result), now=expected_wake - timedelta(hours=1)).status == "preview"
++
++
++def test_ambiguous_wake_itself_uses_earlier_occurrence():
++    result = resolve_sleep_timing(
++        timing(
++            timezone_key="America/New_York",
++            wind_down_start=time(20),
++            sleep_start=time(22),
++            sleep_day_offset=-1,
++            wake_time=time(1, 30),
++        ),
++        wake_date=date(2026, 11, 1),
++    )
++    assert result.status == "resolved"
++    assert result.anchors[3].at == datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
++
++
++def test_skipped_calendar_date_does_not_silently_change_wake_date():
++    assert_withheld(
++        resolve_sleep_timing(timing(timezone_key="Pacific/Apia"), wake_date=date(2011, 12, 30)), "date_shift"
++    )
++
++
++def test_gap_adjustment_cannot_reorder_anchors():
++    assert_withheld(
++        resolve_sleep_timing(
++            timing(
++                timezone_key="America/New_York",
++                wind_down_start=time(2, 30),
++                wind_down_day_offset=0,
++                sleep_start=time(3),
++            ),
++            wake_date=date(2026, 3, 8),
++        ),
++        "invalid_order",
++    )
++
++
++@pytest.mark.parametrize("sleep_start", [time(5), time(6)])
++def test_zero_or_negative_sleep_interval_is_withheld(sleep_start):
++    assert_withheld(resolve_sleep_timing(timing(sleep_start=sleep_start), wake_date=WAKE_DATE), "invalid_order")
++
++
++def test_resolved_timing_does_not_bypass_elapsed_rate_validation():
++    result = resolve_sleep_timing(
++        timing(
++            timezone_key="America/New_York",
++            wind_down_start=time(1, 30),
++            wind_down_day_offset=0,
++            sleep_start=time(3, 30),
++        ),
++        wake_date=date(2026, 3, 8),
++    )
++    assert result.status == "resolved"
++    assert result.anchors[1].at - result.anchors[0].at == timedelta(hours=1)
++    preview = preview_trajectory(trajectory(result), now=result.anchors[0].at)
++    assert preview.status == "withheld"
++    assert preview.reason_code == "rate_exceeded"
++    assert preview.floor_f is None and preview.commands_allowed is False
++
++
++@pytest.mark.parametrize("flags", [{"enabled": False}, {"approved": False}])
++def test_resolved_timing_does_not_enable_or_approve_a_trajectory(flags):
++    result = resolve_sleep_timing(timing(), wake_date=WAKE_DATE)
++    preview = preview_trajectory(trajectory(result, **flags), now=result.anchors[0].at)
++    assert preview.status in ("disabled", "withheld")
++    assert preview.floor_f is None and preview.commands_allowed is False
++
++
++@pytest.mark.parametrize("config", [None, {}, "UTC"])
++def test_invalid_configuration_is_withheld(config):
++    assert_withheld(resolve_sleep_timing(config, wake_date=WAKE_DATE), "invalid_configuration")
++
++
++@pytest.mark.parametrize("wake_date", [None, "2026-01-02", datetime(2026, 1, 2), True])
++def test_wake_date_must_be_a_date_not_a_datetime_or_string(wake_date):
++    assert_withheld(resolve_sleep_timing(timing(), wake_date=wake_date), "invalid_date")
++
++
++@pytest.mark.parametrize("zone", [None, "", "Unknown/Unavailable", "../UTC", "/UTC", 1])
++def test_invalid_or_missing_zone_is_not_replaced_by_host_zone(zone):
++    assert_withheld(resolve_sleep_timing(timing(timezone_key=zone), wake_date=WAKE_DATE), "invalid_timezone")
++
++
++def test_missing_timezone_database_is_explained_without_skipping_or_downloading(monkeypatch):
++    def unavailable(key):
++        raise ZoneInfoNotFoundError(key)
++
++    monkeypatch.setattr(sleep_timing, "ZoneInfo", unavailable)
++    assert_withheld(resolve_sleep_timing(timing(), wake_date=WAKE_DATE), "invalid_timezone")
++
++
++@pytest.mark.parametrize("field", ["wind_down_start", "sleep_start", "wake_time"])
++@pytest.mark.parametrize("value", [None, "07:00", time(7, tzinfo=UTC), time(7, fold=1)])
++def test_wall_times_are_explicit_naive_times_with_fixed_fold_policy(field, value):
++    assert_withheld(resolve_sleep_timing(timing(**{field: value}), wake_date=WAKE_DATE), "invalid_time")
++
++
++@pytest.mark.parametrize("field", ["wind_down_day_offset", "sleep_day_offset"])
++@pytest.mark.parametrize("value", [-2, 1, True, 0.0, "-1"])
++def test_day_offsets_are_exact_integers_for_previous_or_wake_date(field, value):
++    assert_withheld(resolve_sleep_timing(timing(**{field: value}), wake_date=WAKE_DATE), "invalid_offset")
++
++
++@pytest.mark.parametrize("field", ["warming_duration", "return_duration"])
++@pytest.mark.parametrize("value", [None, 2, True, timedelta(0), timedelta(seconds=-1)])
++def test_durations_are_explicit_positive_elapsed_intervals(field, value):
++    assert_withheld(resolve_sleep_timing(timing(**{field: value}), wake_date=WAKE_DATE), "invalid_duration")
++
++
++@pytest.mark.parametrize(
++    ("config", "wake_date"),
++    [
++        (timing(), date.min),
++        (timing(return_duration=timedelta(days=1)), date.max),
++        (timing(warming_duration=timedelta.max), WAKE_DATE),
++    ],
++)
++def test_datetime_range_overflow_is_withheld(config, wake_date):
++    assert_withheld(resolve_sleep_timing(config, wake_date=wake_date), "invalid_time")
++
++
++def test_resolution_is_immutable_and_date_changes_produce_fresh_results():
++    config = timing()
++    before = repr(config)
++    result = resolve_sleep_timing(config, wake_date=WAKE_DATE)
++    tomorrow = resolve_sleep_timing(config, wake_date=WAKE_DATE + timedelta(days=1))
++    assert tomorrow.anchors[3].at - result.anchors[3].at == timedelta(days=1)
++    assert repr(config) == before
++    with pytest.raises(FrozenInstanceError):
++        result.anchors[0].at = datetime(2026, 1, 1)
++    with pytest.raises(FrozenInstanceError):
++        result.commands_allowed = True
++
++
++def test_resolver_has_no_host_clock_network_or_live_importers():
++    path = Path(sleep_timing.__file__)
++    tree = ast.parse(path.read_text(encoding="utf-8"))
++    allowed = {"__future__", "dataclasses", "datetime", "itertools", "typing", "zoneinfo"}
++    for node in ast.walk(tree):
++        if isinstance(node, ast.ImportFrom):
++            assert not node.level and node.module in allowed
++        elif isinstance(node, ast.Import):
++            assert all(alias.name in allowed for alias in node.names)
++        elif isinstance(node, ast.Attribute):
++            assert node.attr not in {"now", "today", "utcnow"}
++    for other in path.parent.glob("*.py"):
++        if other != path:
++            assert "sleep_timing" not in other.read_text(encoding="utf-8"), other.name
+diff --git a/tests/test_sleep_trajectory.py b/tests/test_sleep_trajectory.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_sleep_trajectory.py
+@@ -0,0 +1,302 @@
++# SPDX-License-Identifier: MIT
++"""A disconnected curve preview: arithmetic fixtures, never household recommendations."""
++
++from __future__ import annotations
++
++import ast
++from dataclasses import FrozenInstanceError, replace
++from datetime import UTC, datetime, timedelta, timezone
++from pathlib import Path
++from zoneinfo import ZoneInfo
++
++import pytest
++
++from custom_components.climate_advisor import sleep_trajectory
++from custom_components.climate_advisor.sleep_trajectory import (
++    SleepTrajectory,
++    TrajectoryAnchor,
++    TrajectoryLimits,
++    TrajectoryPreview,
++    preview_trajectory,
++)
++
++START = datetime(2026, 1, 1, 22, tzinfo=UTC)
++
++
++def routine(start=START):
++    return SleepTrajectory(
++        enabled=True,
++        approved=True,
++        limits=TrajectoryLimits(minimum_f=60, maximum_f=80, minimum_width_f=4, maximum_rate_f_per_hour=2.5),
++        anchors=(
++            TrajectoryAnchor(start, 68, 74, "wind_down"),
++            TrajectoryAnchor(start + timedelta(hours=2), 64, 70, "sleeping"),
++            TrajectoryAnchor(start + timedelta(hours=7), 64, 70, "waking"),
++            TrajectoryAnchor(start + timedelta(hours=9), 69, 75, "return_to_day"),
++            TrajectoryAnchor(start + timedelta(hours=11), 68, 74, "daytime"),
++        ),
++    )
++
++
++def changed_anchor(config, index, **changes):
++    anchors = list(config.anchors)
++    anchors[index] = replace(anchors[index], **changes)
++    return replace(config, anchors=tuple(anchors))
++
++
++def assert_withheld(result, reason):
++    assert result.status == "withheld"
++    assert result.reason_code == reason
++    assert result.floor_f is None
++    assert result.ceiling_f is None
++    assert result.phase is None
++    assert result.commands_allowed is False
++    assert result.explanation
++
++
++def test_disabled_by_default_does_not_require_a_schedule_or_read_a_clock():
++    config = SleepTrajectory()
++    result = preview_trajectory(config, now=None)
++    assert config.enabled is False
++    assert config.approved is False
++    assert result.status == "disabled"
++    assert result.reason_code == "disabled"
++    assert result.floor_f is None and result.ceiling_f is None
++    assert result.commands_allowed is False
++    with pytest.raises(TypeError):
++        preview_trajectory(config)
++
++
++def test_enablement_does_not_implicitly_approve_a_routine():
++    assert_withheld(preview_trajectory(SleepTrajectory(enabled=True), now=START), "unapproved")
++
++
++@pytest.mark.parametrize("flag", ["enabled", "approved"])
++@pytest.mark.parametrize("value", [1, "true", None])
++def test_enablement_and_approval_require_real_booleans(flag, value):
++    assert_withheld(preview_trajectory(replace(routine(), **{flag: value}), now=START), "invalid_configuration")
++
++
++@pytest.mark.parametrize(
++    ("hours", "floor", "ceiling", "phase"),
++    [
++        (0, 68, 74, "wind_down"),
++        (1, 66, 72, "wind_down"),
++        (2, 64, 70, "sleeping"),
++        (7, 64, 70, "waking"),
++        (8, 66.5, 72.5, "waking"),
++        (9, 69, 75, "return_to_day"),
++        (10, 68.5, 74.5, "return_to_day"),
++        (11, 68, 74, "daytime"),
++    ],
++)
++def test_approved_example_anchors_and_midpoints(hours, floor, ceiling, phase):
++    result = preview_trajectory(routine(), now=START + timedelta(hours=hours))
++    assert result.status == "preview"
++    assert result.reason_code == "ready"
++    assert (result.floor_f, result.ceiling_f, result.phase) == (floor, ceiling, phase)
++    assert result.commands_allowed is False
++    assert "preview" in result.explanation.lower()
++
++
++def test_every_minute_is_bounded_and_rate_limited_without_command_permission():
++    config = routine()
++    previous = None
++    for minute in range(661):
++        result = preview_trajectory(config, now=START + timedelta(minutes=minute))
++        assert result.status == "preview"
++        assert 60 <= result.floor_f < result.ceiling_f <= 80
++        assert result.ceiling_f - result.floor_f >= 4
++        assert not result.commands_allowed
++        if previous:
++            assert abs(result.floor_f - previous.floor_f) * 60 <= 2.5 + 1e-10
++            assert abs(result.ceiling_f - previous.ceiling_f) * 60 <= 2.5 + 1e-10
++        previous = result
++
++
++def test_sampling_order_and_frequency_cannot_change_the_curve():
++    config = routine()
++    before = repr(config)
++    moments = [START + timedelta(seconds=s) for s in (31, 4000, 30000, 17000, 0, 39600)]
++    first = {instant: preview_trajectory(config, now=instant) for instant in moments}
++    for instant in reversed(moments):
++        assert preview_trajectory(config, now=instant) == first[instant]
++    assert repr(config) == before
++
++
++@pytest.mark.parametrize("instant", [START - timedelta(microseconds=1), START + timedelta(hours=11, microseconds=1)])
++def test_no_extrapolation_outside_the_approved_dated_horizon(instant):
++    assert_withheld(preview_trajectory(routine(), now=instant), "outside_horizon")
++
++
++def test_equivalent_offset_inputs_produce_identical_results():
++    config = routine()
++    zone = timezone(timedelta(hours=5, minutes=30))
++    converted = replace(config, anchors=tuple(replace(a, at=a.at.astimezone(zone)) for a in config.anchors))
++    instant = START + timedelta(hours=8)
++    assert preview_trajectory(converted, now=instant.astimezone(zone)) == preview_trajectory(config, now=instant)
++
++
++@pytest.mark.parametrize("start", [datetime(2026, 3, 8, 6, tzinfo=UTC), datetime(2026, 11, 1, 4, tzinfo=UTC)])
++def test_already_resolved_dst_instants_use_elapsed_not_wall_time(start):
++    zone = ZoneInfo("America/New_York")
++    config = routine(start)
++    converted = replace(config, anchors=tuple(replace(a, at=a.at.astimezone(zone)) for a in config.anchors))
++    midpoint = (start + timedelta(hours=1)).astimezone(zone)
++    result = preview_trajectory(converted, now=midpoint)
++    assert (result.floor_f, result.ceiling_f, result.phase) == (66, 72, "wind_down")
++    if start.month == 11:
++        repeated_hour = (start + timedelta(hours=2)).astimezone(zone)
++        assert midpoint.hour == repeated_hour.hour == 1
++        assert (midpoint.fold, repeated_hour.fold) == (0, 1)
++        assert preview_trajectory(converted, now=repeated_hour).phase == "sleeping"
++
++
++@pytest.mark.parametrize("instant", [None, "2026-01-01T22:00:00Z", START.replace(tzinfo=None)])
++def test_invalid_evaluation_time_is_withheld(instant):
++    assert_withheld(preview_trajectory(routine(), now=instant), "invalid_time")
++
++
++def test_all_anchor_times_are_validated_even_before_reaching_the_bad_anchor():
++    config = changed_anchor(routine(), 4, at=datetime(2026, 1, 2, 9))
++    assert_withheld(preview_trajectory(config, now=START), "invalid_time")
++
++
++def test_utc_normalization_overflow_is_a_withheld_time_not_a_crash():
++    instant = datetime.min.replace(tzinfo=timezone(timedelta(hours=1)))
++    assert_withheld(preview_trajectory(routine(), now=instant), "invalid_time")
++
++
++@pytest.mark.parametrize("kind", ["missing", "mutable", "wrong_type", "wrong_phase", "duplicate", "backwards"])
++def test_invalid_anchor_structure_and_order_are_not_repaired(kind):
++    config = routine()
++    if kind == "missing":
++        config = replace(config, anchors=config.anchors[:-1])
++    elif kind == "mutable":
++        config = replace(config, anchors=list(config.anchors))
++    elif kind == "wrong_type":
++        config = replace(config, anchors=(None, *config.anchors[1:]))
++    elif kind == "wrong_phase":
++        config = changed_anchor(config, 1, phase="daytime")
++    elif kind == "duplicate":
++        same_instant = START.astimezone(timezone(timedelta(hours=2)))
++        config = changed_anchor(config, 1, at=same_instant)
++    else:
++        config = changed_anchor(config, 1, at=START - timedelta(seconds=1))
++    assert_withheld(preview_trajectory(config, now=START), "invalid_anchors")
++
++
++@pytest.mark.parametrize("field", ["floor_f", "ceiling_f"])
++@pytest.mark.parametrize("value", [True, "70", None, float("nan"), float("inf"), -float("inf"), 10**400])
++def test_invalid_band_numbers_are_rejected_not_coerced(field, value):
++    config = changed_anchor(routine(), 4, **{field: value})
++    assert_withheld(preview_trajectory(config, now=START), "invalid_band")
++
++
++@pytest.mark.parametrize(
++    "changes", [{"floor_f": 59}, {"ceiling_f": 81}, {"floor_f": 76}, {"floor_f": 74}, {"floor_f": 72}]
++)
++def test_outside_inverted_or_narrow_bands_are_not_clamped(changes):
++    assert_withheld(preview_trajectory(changed_anchor(routine(), 4, **changes), now=START), "invalid_band")
++
++
++@pytest.mark.parametrize(
++    "changes",
++    [
++        {"minimum_f": float("nan")},
++        {"maximum_f": float("inf")},
++        {"minimum_f": 80},
++        {"minimum_f": 81},
++        {"minimum_width_f": 0},
++        {"minimum_width_f": -1},
++        {"minimum_width_f": 21},
++        {"maximum_rate_f_per_hour": 0},
++        {"maximum_rate_f_per_hour": -1},
++        {"maximum_rate_f_per_hour": True},
++        {"maximum_rate_f_per_hour": "2.5"},
++        {"maximum_rate_f_per_hour": float("inf")},
++    ],
++)
++def test_limits_are_explicit_finite_and_feasible(changes):
++    config = routine()
++    config = replace(config, limits=replace(config.limits, **changes))
++    assert_withheld(preview_trajectory(config, now=START), "invalid_limits")
++
++
++@pytest.mark.parametrize("config", [None, {}, SleepTrajectory(enabled=True, approved=True)])
++def test_missing_configuration_cannot_make_up_a_band(config):
++    assert_withheld(preview_trajectory(config, now=START), "invalid_configuration")
++
++
++def test_exact_bounds_width_and_rate_limits_are_inclusive():
++    config = routine()
++    config = replace(config, limits=replace(config.limits, minimum_f=64, maximum_f=75, minimum_width_f=6))
++    assert preview_trajectory(config, now=START + timedelta(hours=8)).status == "preview"
++    too_fast = replace(config, limits=replace(config.limits, maximum_rate_f_per_hour=2.499999))
++    assert_withheld(preview_trajectory(too_fast, now=START), "rate_exceeded")
++
++
++def test_rate_limit_applies_to_the_ceiling_independently_of_the_floor():
++    config = changed_anchor(routine(), 3, ceiling_f=76)
++    assert_withheld(preview_trajectory(config, now=START), "rate_exceeded")
++
++
++@pytest.mark.parametrize(("index", "floor", "ceiling"), [(0, 62, 68), (2, 65, 71), (3, 63, 69)])
++def test_wind_down_sleep_and_waking_direction_are_preserved(index, floor, ceiling):
++    config = changed_anchor(routine(), index, floor_f=floor, ceiling_f=ceiling)
++    assert_withheld(preview_trajectory(config, now=START), "phase_direction")
++
++
++def test_extreme_finite_inputs_do_not_overflow_interpolation():
++    config = routine()
++    bands = [(1e308, 1.1e308), (-1e308, -9e307), (-1e308, -9e307), (1e308, 1.1e308), (1e308, 1.1e308)]
++    config = replace(
++        config,
++        limits=TrajectoryLimits(-1.1e308, 1.7e308, 1, 1.7e308),
++        anchors=tuple(replace(a, floor_f=f, ceiling_f=c) for a, (f, c) in zip(config.anchors, bands, strict=True)),
++    )
++    result = preview_trajectory(config, now=START + timedelta(hours=1))
++    assert result.status == "preview"
++    assert result.floor_f == 0
++    assert result.ceiling_f == 1e307
++
++
++def test_float_output_cannot_collapse_an_approved_narrow_band():
++    config = routine()
++    high = (70, 70.00000000000001)
++    low = (69.99999999999999, 70)
++    config = replace(
++        config,
++        limits=TrajectoryLimits(69, 71, 1e-14, 1),
++        anchors=tuple(
++            replace(a, floor_f=f, ceiling_f=c)
++            for a, (f, c) in zip(config.anchors, (high, low, low, high, high), strict=True)
++        ),
++    )
++    assert_withheld(preview_trajectory(config, now=START + timedelta(hours=1)), "unrepresentable_preview")
++
++
++def test_inputs_and_results_are_immutable_and_never_grant_control():
++    config = routine()
++    result = preview_trajectory(config, now=START)
++    for obj, field, value in [(config, "enabled", False), (config.anchors[0], "floor_f", 99), (result, "floor_f", 99)]:
++        with pytest.raises(FrozenInstanceError):
++            setattr(obj, field, value)
++    with pytest.raises(TypeError):
++        TrajectoryPreview(status="preview", reason_code="ready", explanation="test", commands_allowed=True)
++
++
++def test_calculator_has_no_policy_io_or_live_planner_imports():
++    path = Path(sleep_trajectory.__file__)
++    tree = ast.parse(path.read_text(encoding="utf-8"))
++    allowed = {"__future__", "dataclasses", "datetime", "fractions", "itertools", "math", "typing"}
++    for node in ast.walk(tree):
++        if isinstance(node, ast.ImportFrom):
++            assert not node.level
++            assert node.module in allowed
++        elif isinstance(node, ast.Import):
++            assert all(alias.name in allowed for alias in node.names)
++    for other in path.parent.glob("*.py"):
++        if other == path:
++            continue
++        assert "sleep_trajectory" not in other.read_text(encoding="utf-8"), other.name

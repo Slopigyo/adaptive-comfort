@@ -1,0 +1,55 @@
+{
+  "files": [
+    {
+      "bytes": 16622,
+      "path": "custom_components/climate_advisor/adaptive_mode_preview.py",
+      "sha256": "d8700509f2456b4a356f800b2cbea8cd0f90b30e0d519d5eb4fe602ecf93d6a4"
+    },
+    {
+      "bytes": 7199,
+      "path": "custom_components/climate_advisor/sleep_timing.py",
+      "sha256": "28917ae9287e7556c9cc0e65c5b70e89d62db228eb64c3b0da7bdf5012165ed4"
+    },
+    {
+      "bytes": 9107,
+      "path": "custom_components/climate_advisor/sleep_trajectory.py",
+      "sha256": "90186f082a8ef1e877346d18fd49fd0edad908fd39b5ad4bd8080e5df0cb981a"
+    },
+    {
+      "bytes": 9396,
+      "path": "docs/adaptive-mode-preview.md",
+      "sha256": "8873c87b1a7b1011172cbd2025efbe99b079b0c01101a991daa387fe753745d3"
+    },
+    {
+      "bytes": 8632,
+      "path": "docs/sleep-trajectory-preview.md",
+      "sha256": "b3fdda5f06c63939d21fe29bc01cfbdc9c7ea8adbad995b8d54fb7007fa11b1a"
+    },
+    {
+      "bytes": 23774,
+      "path": "tests/test_adaptive_mode_preview.py",
+      "sha256": "e2f286720e681a6ebac7e379e44a49d4620bd40db658833f88b581a4569f32fc"
+    },
+    {
+      "bytes": 12324,
+      "path": "tests/test_sleep_timing.py",
+      "sha256": "80c00b8a708cc7c96458b765fb7917b80cfd66bd7992c805ffd30778a7ee2429"
+    },
+    {
+      "bytes": 12668,
+      "path": "tests/test_sleep_trajectory.py",
+      "sha256": "f3f27cde646eefc1702dd16101b71f9484b6b410f904185faf15e2bd251bf6d4"
+    }
+  ],
+  "license": "MIT",
+  "patch": {
+    "bytes": 103386,
+    "path": "preview.patch",
+    "sha256": "583de9ecfd567639c711d487cc24c4f542885cb83d1169d11f292c17758de9c8"
+  },
+  "schema_version": 1,
+  "upstream": {
+    "base_commit": "68c6c2d7ea63a921afed7a391253e448fb6a5ceb",
+    "url": "https://github.com/gunkl/ClimateAdvisor.git"
+  }
+}
